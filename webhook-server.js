@@ -1,140 +1,263 @@
+/**
+ * Floatly × Evolution API webhook receiver
+ * ─────────────────────────────────────────
+ * Listens for messages from your Evolution API instance, filters to your
+ * agent group, parses orders (regex first, Claude fallback), writes to
+ * Supabase `orders` table.
+ *
+ * Deploy: Railway, Render, Fly.io, or any Node host.
+ * Required env vars:
+ *   SUPABASE_URL, SUPABASE_SERVICE_KEY  → from your Supabase project
+ *   ANTHROPIC_API_KEY                   → for Claude fallback parsing
+ *   GROUP_JID                           → e.g. "1203630xxxxx@g.us"
+ *   EVOLUTION_WEBHOOK_TOKEN             → any random string, set same in Evolution
+ *   PORT                                → optional, defaults 3000
+ */
+
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
-const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-// ---------- Environment variables (set on Railway) ----------
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const GROUP_JID = process.env.GROUP_JID;
-const WEBHOOK_TOKEN = process.env.EVOLUTION_WEBHOOK_TOKEN;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !ANTHROPIC_API_KEY || !GROUP_JID || !WEBHOOK_TOKEN) {
-  console.error('❌ Missing one or more required environment variables.');
+// ─── Required env vars (fail fast with a clear message) ──────────
+const REQUIRED = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'GROUP_JID', 'EVOLUTION_WEBHOOK_TOKEN'];
+const missing = REQUIRED.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error('❌ Missing required environment variables:', missing.join(', '));
+  console.error('   Set these in Railway → Variables, then redeploy.');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// ---------- Helper: Regex-based order extraction (faster, cheaper) ----------
-function parseWithRegex(text) {
-  const lower = text.toLowerCase();
-  // Look for amounts: 50000, 50k, 50,000, 50.000, hundred thousand, 1m, etc.
-  const amountRegex = /(\d+(?:[.,]\d+)?)\s*(k|m|elfu|milioni|thousand|million)?/i;
-  const match = text.match(amountRegex);
-  if (!match) return null;
-
-  let amount = parseFloat(match[1].replace(',', '.'));
-  const unit = (match[2] || '').toLowerCase();
-  if (unit === 'k' || unit === 'elfu' || unit === 'thousand') amount *= 1000;
-  else if (unit === 'm' || unit === 'milioni' || unit === 'million') amount *= 1000000;
-
-  // Detect payment method & destination
-  let method = null;
-  let destination = null;
-  if (/(mpesa|m-pesa|vodacom|halopesa|tigo pesa|airtel money)/i.test(text)) method = 'M-Pesa';
-  else if (/tigo ?pesa/i.test(text)) method = 'Tigo Pesa';
-  else if (/airtel money/i.test(text)) method = 'Airtel Money';
-  else method = 'Unknown';
-
-  if (/(kwenda|kwa|to)\s+(tigo|vodacom|airtel|halotel|zantel)/i.test(text)) {
-    const matchDest = text.match(/(kwenda|kwa|to)\s+(\w+)/i);
-    if (matchDest) destination = matchDest[2];
+// Claude fallback is OPTIONAL — runs only if ANTHROPIC_API_KEY is set
+let anthropic = null;
+if (process.env.ANTHROPIC_API_KEY) {
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    console.log('✓ Claude fallback parser enabled');
+  } catch (e) {
+    console.warn('⚠ Anthropic SDK not installed — running regex-only');
   }
-
-  return { amount, method, destination };
+} else {
+  console.log('ℹ ANTHROPIC_API_KEY not set — running regex-only (fine for testing)');
 }
 
-// ---------- Main webhook endpoint (called by Evolution API) ----------
+const GROUP_JID = process.env.GROUP_JID;
+const WEBHOOK_TOKEN = process.env.EVOLUTION_WEBHOOK_TOKEN;
+
+// ─── Networks Floatly recognises ───────────────────────────────────
+const NETWORK_ALIASES = {
+  'mpesa': 'M-Pesa', 'm-pesa': 'M-Pesa', 'm pesa': 'M-Pesa', 'mp': 'M-Pesa',
+  'tigopesa': 'Mixx by Yas', 'tigo pesa': 'Mixx by Yas', 'tigo': 'Mixx by Yas',
+  'mixx': 'Mixx by Yas', 'mixx by yas': 'Mixx by Yas', 'yas': 'Mixx by Yas',
+  'airtel': 'Airtel Money', 'airtel money': 'Airtel Money', 'am': 'Airtel Money',
+  'halotel': 'HaloPesa', 'halopesa': 'HaloPesa', 'halo': 'HaloPesa', 'hp': 'HaloPesa',
+  'azampesa': 'AzamPesa', 'azam': 'AzamPesa', 'ap': 'AzamPesa',
+  'crdb': 'CRDB', 'nmb': 'NMB', 'nbc': 'NBC', 'tcb': 'TCB',
+  'selcom': 'SELCOM', 'maendeleo': 'Maendeleo',
+  'cash': 'Cash', 'pesa taslimu': 'Cash', 'taslim': 'Cash'
+};
+
+const normaliseNetwork = (raw) => {
+  if (!raw) return null;
+  const k = raw.toLowerCase().trim();
+  return NETWORK_ALIASES[k] || (Object.entries(NETWORK_ALIASES).find(
+    ([alias]) => k.includes(alias))?.[1] ?? null);
+};
+
+// ─── Regex parser (fast path) ─────────────────────────────────────
+// Handles common Tanzanian patterns:
+//   "naomba 500000 mpesa kwenda tigo"
+//   "buy 1m airtel"
+//   "tigo to mpesa 200k"
+//   "Mpesa 300,000 -> CRDB"
+function parseWithRegex(text) {
+  const t = text.toLowerCase().replace(/,/g, '').replace(/\s+/g, ' ').trim();
+
+  // Amount: 200000, 200k, 1.5m, 1m, 500000/=
+  let amount = null;
+  const mAmt = t.match(/(\d+(?:\.\d+)?)\s*(k|m|elfu|milioni)?/i);
+  if (mAmt) {
+    let n = parseFloat(mAmt[1]);
+    const unit = (mAmt[2] || '').toLowerCase();
+    if (unit === 'k' || unit === 'elfu') n *= 1000;
+    else if (unit === 'm' || unit === 'milioni') n *= 1_000_000;
+    if (n >= 1000 && n <= 50_000_000) amount = n;
+  }
+
+  // Networks: pick the first two known-network hits
+  const found = [];
+  for (const alias of Object.keys(NETWORK_ALIASES)) {
+    if (t.includes(alias)) {
+      const canonical = NETWORK_ALIASES[alias];
+      if (!found.find(f => f.canonical === canonical)) {
+        found.push({ alias, canonical, idx: t.indexOf(alias) });
+      }
+    }
+  }
+  found.sort((a, b) => a.idx - b.idx);
+
+  // Direction hints (kwenda, to, ->, =>, kutoka)
+  const hasDirection = /(kwenda|->|=>|to\s|kutoka|from\s)/.test(t);
+
+  if (amount && found.length >= 2 && hasDirection) {
+    return {
+      amount,
+      from_network: found[0].canonical,
+      to_network: found[1].canonical,
+      type: 'exchange',
+      confidence: 'high',
+      method: 'regex'
+    };
+  }
+  if (amount && found.length === 1) {
+    return {
+      amount,
+      from_network: found[0].canonical,
+      to_network: null,
+      type: /buy|nunua|naomba/.test(t) ? 'buy' : 'sell',
+      confidence: 'medium',
+      method: 'regex'
+    };
+  }
+  return null; // fall through to Claude
+}
+
+// ─── Claude fallback parser (only runs if anthropic client exists) ──
+async function parseWithClaude(text) {
+  if (!anthropic) return null; // Skip silently when key not configured
+
+  const prompt = `You are parsing a mobile-money float exchange order from a Tanzanian agents WhatsApp group. Messages may be in English or Swahili (or mixed). Extract structured data.
+
+Networks recognised: M-Pesa, Mixx by Yas, Airtel Money, HaloPesa, AzamPesa, CRDB, NMB, NBC, TCB, SELCOM, Maendeleo, Cash.
+
+Message: "${text}"
+
+Respond with ONLY a JSON object, no markdown, no preamble:
+{
+  "is_order": true|false,
+  "type": "exchange"|"buy"|"sell"|null,
+  "amount": number|null,
+  "from_network": "<canonical name>"|null,
+  "to_network": "<canonical name>"|null,
+  "notes": "<short note>"|null,
+  "confidence": "high"|"medium"|"low"
+}
+
+Rules:
+- If the message is clearly NOT an order (greeting, joke, question), set is_order=false.
+- Amount must be the TZS figure as a plain number (200k → 200000, 1.5m → 1500000).
+- Use exact canonical network names from the list above.
+- For "exchange", from_network is the source, to_network is the destination.`;
+
+  try {
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const txt = res.content[0].text.trim().replace(/```json|```/g, '');
+    const parsed = JSON.parse(txt);
+    if (!parsed.is_order) return null;
+    return { ...parsed, method: 'claude' };
+  } catch (e) {
+    console.error('Claude parse failed:', e.message);
+    return null;
+  }
+}
+
+// ─── Agent lookup ─────────────────────────────────────────────────
+async function findAgentByPhone(phone) {
+  // Evolution returns JIDs like "255712345678@s.whatsapp.net"
+  const cleaned = phone.replace(/[^0-9]/g, '');
+  const { data } = await supabase
+    .from('agents')
+    .select('id, name, phone')
+    .or(`phone.eq.${cleaned},phone.eq.+${cleaned},phone.eq.0${cleaned.slice(3)}`)
+    .limit(1)
+    .maybeSingle();
+  return data;
+}
+
+// ─── Webhook endpoint ─────────────────────────────────────────────
 app.post('/webhook/evolution', async (req, res) => {
-  // Verify token to prevent unauthorized calls
-  const token = req.headers['x-webhook-token'];
-  if (token !== WEBHOOK_TOKEN) {
-    console.warn('❌ Unauthorized webhook call – wrong token');
-    return res.status(401).json({ error: 'Invalid token' });
+  // Token check (set webhookByEvents in Evolution to include this)
+  if (req.headers['x-webhook-token'] !== WEBHOOK_TOKEN) {
+    return res.status(401).json({ error: 'unauthorised' });
   }
 
-  const body = req.body;
-  // Evolution sends different payload shapes. Handle common ones.
-  const messages = body.messages || (body.data && body.data.messages) || [];
-  if (!messages.length) {
-    return res.status(200).json({ received: true, message: 'No messages in payload' });
-  }
-
-  for (const msg of messages) {
-    const chatId = msg.key?.remoteJid || msg.remoteJid || msg.from;
-    // Only process messages from the target group
-    if (chatId !== GROUP_JID) continue;
-
-    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.text;
-    if (!text) continue;
-
-    const sender = msg.pushName || msg.notifyName || 'Unknown';
-    console.log(`📩 New message from ${sender}: ${text}`);
-
-    // Try regex first (fast path)
-    let order = parseWithRegex(text);
-
-    // If regex fails, use Claude (slower but catches complex phrasings)
-    if (!order) {
-      console.log('🤖 Regex missed, asking Claude...');
-      try {
-        const claudeResponse = await anthropic.messages.create({
-          model: 'claude-3-haiku-20240307',
-          max_tokens: 200,
-          temperature: 0,
-          system: `You are an order parser for a Tanzanian agent. 
-                    Extract: amount (as number in TZS), paymentMethod (M-Pesa/Tigo Pesa/Airtel Money/Unknown), destination (optional, e.g., Tigo, Vodacom).
-                    Return JSON only: {"amount": number, "paymentMethod": string, "destination": string|null}
-                    If no order, return {"amount": null}.`,
-          messages: [{ role: 'user', content: text }]
-        });
-        const jsonMatch = claudeResponse.content[0].text.match(/\{.*\}/s);
-        if (jsonMatch) {
-          order = JSON.parse(jsonMatch[0]);
-          if (order.amount === null) order = null;
-        }
-      } catch (err) {
-        console.error('Claude error:', err.message);
-      }
-    }
-
-    if (order && order.amount && order.amount > 0) {
-      // Save to Supabase
-      const { error } = await supabase
-        .from('orders')
-        .insert({
-          amount: order.amount,
-          payment_method: order.method || order.paymentMethod,
-          destination: order.destination,
-          customer_name: sender,
-          raw_message: text,
-          status: 'pending',
-          created_at: new Date().toISOString()
-        });
-      if (error) {
-        console.error('❌ Supabase insert error:', error);
-      } else {
-        console.log(`✅ Order saved: ${order.amount} TZS via ${order.method || order.paymentMethod} from ${sender}`);
-      }
-    } else {
-      console.log(`⏩ No order detected in message: "${text}"`);
-    }
-  }
-
+  // ACK immediately so Evolution doesn't retry
   res.status(200).json({ received: true });
+
+  try {
+    const event = req.body.event || req.body.eventName;
+    if (event !== 'messages.upsert' && event !== 'MESSAGES_UPSERT') return;
+
+    const data = req.body.data;
+    const remoteJid = data?.key?.remoteJid;
+
+    // Only process the configured group
+    if (remoteJid !== GROUP_JID) return;
+    if (data.key.fromMe) return; // skip our own messages
+
+    const text =
+      data.message?.conversation ||
+      data.message?.extendedTextMessage?.text ||
+      '';
+    if (!text || text.length < 3) return;
+
+    const senderJid = data.key.participant || remoteJid;
+    const senderPhone = senderJid.split('@')[0];
+    const senderName = data.pushName || 'Unknown';
+
+    // Parse: regex first, Claude on fallback
+    let parsed = parseWithRegex(text);
+    if (!parsed) parsed = await parseWithClaude(text);
+    if (!parsed) {
+      console.log('Not an order:', text.slice(0, 80));
+      return;
+    }
+
+    // Match agent (optional — order still saved if no match)
+    const agent = await findAgentByPhone(senderPhone);
+
+    const orderRow = {
+      agent_name: agent?.name || senderName,
+      agent_phone: senderPhone,
+      type: parsed.type,
+      from_network: parsed.from_network,
+      to_network: parsed.to_network,
+      amount: parsed.amount,
+      raw_message: text,
+      source: 'whatsapp_group',
+      status: 'pending',
+      parsed_confidence: parsed.confidence,
+      notes: parsed.notes ||
+        (agent ? null : `Unregistered phone: ${senderPhone}`)
+    };
+
+    const { error } = await supabase.from('orders').insert(orderRow);
+    if (error) {
+      console.error('Supabase insert failed:', error);
+    } else {
+      console.log(
+        `✓ Order saved [${parsed.method}/${parsed.confidence}]: ` +
+        `${parsed.amount} ${parsed.from_network || ''}→${parsed.to_network || ''} ` +
+        `from ${senderName}`
+      );
+    }
+  } catch (err) {
+    console.error('Handler error:', err);
+  }
 });
 
-// Health check endpoint for Railway
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
-});
+app.get('/', (_req, res) => res.json({ status: 'ok', service: 'floatly-evolution-bridge' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Floatly bridge listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Listening on :${PORT}`));
