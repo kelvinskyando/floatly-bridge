@@ -31,7 +31,13 @@ if (missing.length) {
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_SERVICE_KEY,
+  {
+    auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { params: { eventsPerSecond: 0 } },
+    // Server-side: we only do inserts; no realtime/auth needed
+    global: { headers: { 'x-client-info': 'floatly-evolution-bridge' } }
+  }
 );
 
 // Claude fallback is OPTIONAL — runs only if ANTHROPIC_API_KEY is set
