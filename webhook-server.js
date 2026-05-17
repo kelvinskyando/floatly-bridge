@@ -191,6 +191,71 @@ async function findAgentByPhone(phone) {
   return data;
 }
 
+// ─── Image upload to Supabase Storage ──────────────────────────────
+// Evolution provides the image in one of two ways:
+//   1. Inline base64 in `data.message.base64` (when base64=true in webhook config)
+//   2. As a media file fetchable via Evolution's /chat/getBase64FromMediaMessage endpoint
+// We try the inline path first (cheapest), then fetch as fallback.
+async function uploadImage(data, imageMsg, senderPhone) {
+  let base64Data = data.message?.base64 || null;
+
+  // Fallback: fetch from Evolution if not inline
+  if (!base64Data && process.env.EVOLUTION_BASE_URL && process.env.EVOLUTION_API_KEY) {
+    try {
+      const url = `${process.env.EVOLUTION_BASE_URL.replace(/\/$/, '')}` +
+                  `/chat/getBase64FromMediaMessage/${process.env.EVOLUTION_INSTANCE || 'floatly'}`;
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'apikey': process.env.EVOLUTION_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ message: { key: data.key } })
+      });
+      const j = await r.json();
+      base64Data = j.base64 || null;
+    } catch (e) {
+      console.warn('Evolution media fetch failed:', e.message);
+    }
+  }
+
+  if (!base64Data) {
+    console.warn('No image data available to upload');
+    return null;
+  }
+
+  // Strip optional data URL prefix
+  const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
+  const buffer = Buffer.from(cleanBase64, 'base64');
+
+  // Sanity check: refuse anything > 8 MB
+  if (buffer.length > 8 * 1024 * 1024) {
+    console.warn(`Image too large (${buffer.length} bytes), skipping`);
+    return null;
+  }
+
+  // Determine extension from mimetype, fallback to .jpg
+  const mime = imageMsg.mimetype || 'image/jpeg';
+  const ext = mime.split('/')[1]?.split(';')[0] || 'jpg';
+  const filename = `${senderPhone}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+
+  const { data: up, error } = await supabase.storage
+    .from('order-proofs')
+    .upload(filename, buffer, {
+      contentType: mime,
+      cacheControl: '3600',
+      upsert: false
+    });
+  if (error) throw error;
+
+  // Get the public URL
+  const { data: { publicUrl } } = supabase.storage
+    .from('order-proofs')
+    .getPublicUrl(up.path);
+
+  return publicUrl;
+}
+
 // ─── Webhook endpoint ─────────────────────────────────────────────
 app.post('/webhook/evolution', async (req, res) => {
   // Token check (set webhookByEvents in Evolution to include this)
@@ -212,11 +277,22 @@ app.post('/webhook/evolution', async (req, res) => {
     if (remoteJid !== GROUP_JID) return;
     if (data.key.fromMe) return; // skip our own messages
 
-    const text =
-      data.message?.conversation ||
-      data.message?.extendedTextMessage?.text ||
-      '';
-    if (!text || text.length < 3) return;
+    // ─── Extract message content (text OR image with caption) ─────
+    // WhatsApp image messages put the order text in `caption`, and
+    // the image bytes in `imageMessage`. We treat the caption as the
+    // order text and (in Phase 1) just store the image alongside.
+    const m = data.message || {};
+    const imageMsg = m.imageMessage;
+    const isImage = !!imageMsg;
+
+    const text = isImage
+      ? (imageMsg.caption || '')
+      : (m.conversation || m.extendedTextMessage?.text || '');
+
+    if (!text || text.length < 3) {
+      if (isImage) console.log('Image with no caption — skipped');
+      return;
+    }
 
     const senderJid = data.key.participant || remoteJid;
     const senderPhone = senderJid.split('@')[0];
@@ -228,6 +304,16 @@ app.post('/webhook/evolution', async (req, res) => {
     if (!parsed) {
       console.log('Not an order:', text.slice(0, 80));
       return;
+    }
+
+    // ─── Upload image to Supabase Storage (if present) ────────────
+    let imageUrl = null;
+    if (isImage) {
+      try {
+        imageUrl = await uploadImage(data, imageMsg, senderPhone);
+      } catch (e) {
+        console.error('Image upload failed (saving order anyway):', e.message);
+      }
     }
 
     // Match agent (optional — order still saved if no match)
@@ -244,6 +330,8 @@ app.post('/webhook/evolution', async (req, res) => {
       source: 'whatsapp_group',
       status: 'pending',
       parsed_confidence: parsed.confidence,
+      image_url: imageUrl,
+      image_caption: isImage ? text : null,
       notes: parsed.notes ||
         (agent ? null : `Unregistered phone: ${senderPhone}`)
     };
@@ -253,7 +341,7 @@ app.post('/webhook/evolution', async (req, res) => {
       console.error('Supabase insert failed:', error);
     } else {
       console.log(
-        `✓ Order saved [${parsed.method}/${parsed.confidence}]: ` +
+        `✓ Order saved [${parsed.method}/${parsed.confidence}]${imageUrl ? ' 📎' : ''}: ` +
         `${parsed.amount} ${parsed.from_network || ''}→${parsed.to_network || ''} ` +
         `from ${senderName}`
       );
@@ -267,3 +355,4 @@ app.get('/', (_req, res) => res.json({ status: 'ok', service: 'floatly-evolution
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+
